@@ -159,7 +159,7 @@ void BeginMenuButtons(u32 num_items = 0, float y_align = 0.0f, float x_padding =
                       float y_padding = LAYOUT_MENU_BUTTON_Y_PADDING, float item_height = LAYOUT_MENU_BUTTON_HEIGHT);
 void EndMenuButtons();
 bool MenuButtonFrame(const char* str_id, bool enabled, float height, bool* visible, bool* hovered, ImVec2* min,
-                     ImVec2* max, ImGuiButtonFlags flags = 0);
+                     ImVec2* max, ImGuiButtonFlags flags = 0, float hover_alpha = 1.0f);
 void MenuHeading(const char* title, bool draw_line = true);
 bool ActiveButton(const char* title, bool is_active, bool enabled = true,
                   float height = LAYOUT_MENU_BUTTON_HEIGHT_NO_SUMMARY, ImFont* font = g_large_font);

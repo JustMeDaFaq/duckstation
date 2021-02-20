@@ -2,9 +2,11 @@
 
 #include "fullscreen_ui.h"
 #include "IconsFontAwesome5.h"
+#include "cheevos.h"
 #include "common/byte_stream.h"
 #include "common/file_system.h"
 #include "common/log.h"
+#include "common/lru_cache.h"
 #include "common/make_array.h"
 #include "common/string.h"
 #include "common/string_util.h"
@@ -77,6 +79,7 @@ static void ClearImGuiFocus();
 static void ReturnToMainWindow();
 static void DrawLandingWindow();
 static void DrawQuickMenu(MainWindowType type);
+static void DrawAchievementWindow();
 static void DrawDebugMenu();
 static void DrawStatsOverlay();
 static void DrawOSDMessages();
@@ -99,15 +102,18 @@ static std::unique_ptr<HostDisplayTexture> LoadTextureResource(const char* name)
 static bool LoadResources();
 static void DestroyResources();
 
-std::unique_ptr<HostDisplayTexture> s_app_icon_texture;
-std::unique_ptr<HostDisplayTexture> s_placeholder_texture;
-std::array<std::unique_ptr<HostDisplayTexture>, static_cast<u32>(DiscRegion::Count)> s_disc_region_textures;
-std::array<std::unique_ptr<HostDisplayTexture>, static_cast<u32>(GameListCompatibilityRating::Count)>
+static HostDisplayTexture* GetCachedTexture(const std::string& name);
+
+static std::unique_ptr<HostDisplayTexture> s_app_icon_texture;
+static std::unique_ptr<HostDisplayTexture> s_placeholder_texture;
+static std::array<std::unique_ptr<HostDisplayTexture>, static_cast<u32>(DiscRegion::Count)> s_disc_region_textures;
+static std::array<std::unique_ptr<HostDisplayTexture>, static_cast<u32>(GameListCompatibilityRating::Count)>
   s_game_compatibility_textures;
-std::unique_ptr<HostDisplayTexture> s_fallback_disc_texture;
-std::unique_ptr<HostDisplayTexture> s_fallback_exe_texture;
-std::unique_ptr<HostDisplayTexture> s_fallback_psf_texture;
-std::unique_ptr<HostDisplayTexture> s_fallback_playlist_texture;
+static std::unique_ptr<HostDisplayTexture> s_fallback_disc_texture;
+static std::unique_ptr<HostDisplayTexture> s_fallback_exe_texture;
+static std::unique_ptr<HostDisplayTexture> s_fallback_psf_texture;
+static std::unique_ptr<HostDisplayTexture> s_fallback_playlist_texture;
+static LRUCache<std::string, std::unique_ptr<HostDisplayTexture>> s_texture_cache;
 
 //////////////////////////////////////////////////////////////////////////
 // Settings
@@ -179,6 +185,25 @@ static std::vector<const GameListEntry*> s_game_list_sorted_entries;
 static std::thread s_game_list_load_thread;
 
 //////////////////////////////////////////////////////////////////////////
+// Notifications
+//////////////////////////////////////////////////////////////////////////
+struct Notification
+{
+  NotificationType type;
+  std::string badge_path;
+  std::string title;
+  std::string text;
+  Common::Timer::Value start_time;
+  float duration;
+};
+
+static void DrawNotifications();
+
+static void DrawNotification(const Notification& notification, ImVec2& position);
+
+static std::vector<Notification> s_notifications;
+
+//////////////////////////////////////////////////////////////////////////
 // Main
 //////////////////////////////////////////////////////////////////////////
 
@@ -207,7 +232,8 @@ bool HasActiveWindow()
 
 void SystemCreated()
 {
-  s_current_main_window = MainWindowType::None;
+  // s_current_main_window = MainWindowType::None;
+  s_current_main_window = MainWindowType::Achievements;
   ClearImGuiFocus();
 }
 
@@ -291,8 +317,10 @@ void Render()
       DrawSettingsWindow();
       break;
     case MainWindowType::QuickMenu:
-    case MainWindowType::MoreQuickMenu:
       DrawQuickMenu(s_current_main_window);
+      break;
+    case MainWindowType::Achievements:
+      DrawAchievementWindow();
       break;
     default:
       break;
@@ -309,6 +337,7 @@ void Render()
 
   ImGuiFullscreen::EndLayout();
 
+  DrawNotifications();
   DrawOSDMessages();
 }
 
@@ -388,6 +417,7 @@ bool LoadResources()
 
 void DestroyResources()
 {
+  s_texture_cache.Clear();
   s_app_icon_texture.reset();
   s_placeholder_texture.reset();
   s_fallback_playlist_texture.reset();
@@ -400,32 +430,45 @@ void DestroyResources()
     tex.reset();
 }
 
-std::unique_ptr<HostDisplayTexture> LoadTextureResource(const char* name)
+static std::unique_ptr<HostDisplayTexture> LoadTexture(const char* path, bool from_package)
 {
-  std::unique_ptr<HostDisplayTexture> texture;
-
-  const std::string path(StringUtil::StdStringFromFormat("resources" FS_OSPATH_SEPARATOR_STR "%s", name));
-  std::unique_ptr<ByteStream> stream = s_host_interface->OpenPackageFile(path.c_str(), BYTESTREAM_OPEN_READ);
+  std::unique_ptr<ByteStream> stream;
+  if (from_package)
+    stream = s_host_interface->OpenPackageFile(path, BYTESTREAM_OPEN_READ);
+  else
+    stream = FileSystem::OpenFile(path, BYTESTREAM_OPEN_READ);
   if (!stream)
   {
-    Log_ErrorPrintf("Failed to open texture resource '%s'", path.c_str());
+    Log_ErrorPrintf("Failed to open texture resource '%s'", path);
     return {};
   }
 
   Common::RGBA8Image image;
-  if (Common::LoadImageFromStream(&image, stream.get()) && image.IsValid())
+  if (!Common::LoadImageFromStream(&image, stream.get()) && image.IsValid())
   {
-    texture = s_host_interface->GetDisplay()->CreateTexture(image.GetWidth(), image.GetHeight(), 1, 1, 1,
-                                                            HostDisplayPixelFormat::RGBA8, image.GetPixels(),
-                                                            image.GetByteStride());
-    if (texture)
-    {
-      Log_DevPrintf("Uploaded texture resource '%s' (%ux%u)", name, image.GetWidth(), image.GetHeight());
-      return texture;
-    }
-
-    Log_ErrorPrintf("failed to create %ux%u texture for resource", image.GetWidth(), image.GetHeight());
+    Log_ErrorPrintf("Failed to read texture resource '%s'", path);
+    return {};
   }
+
+  std::unique_ptr<HostDisplayTexture> texture = s_host_interface->GetDisplay()->CreateTexture(
+    image.GetWidth(), image.GetHeight(), 1, 1, 1, HostDisplayPixelFormat::RGBA8, image.GetPixels(),
+    image.GetByteStride());
+  if (!texture)
+  {
+    Log_ErrorPrintf("failed to create %ux%u texture for resource", image.GetWidth(), image.GetHeight());
+    return {};
+  }
+
+  Log_DevPrintf("Uploaded texture resource '%s' (%ux%u)", path, image.GetWidth(), image.GetHeight());
+  return texture;
+}
+
+std::unique_ptr<HostDisplayTexture> LoadTextureResource(const char* name)
+{
+  const std::string path(StringUtil::StdStringFromFormat("resources" FS_OSPATH_SEPARATOR_STR "%s", name));
+  std::unique_ptr<HostDisplayTexture> texture = LoadTexture(path.c_str(), true);
+  if (texture)
+    return texture;
 
   Log_ErrorPrintf("Missing resource '%s', using fallback", name);
 
@@ -436,6 +479,23 @@ std::unique_ptr<HostDisplayTexture> LoadTextureResource(const char* name)
     Panic("Failed to create placeholder texture");
 
   return texture;
+}
+
+HostDisplayTexture* GetCachedTexture(const std::string& name)
+{
+  std::unique_ptr<HostDisplayTexture>* tex_ptr = s_texture_cache.Lookup(name);
+  if (!tex_ptr)
+  {
+    std::unique_ptr<HostDisplayTexture> tex = LoadTexture(name.c_str(), false);
+    tex_ptr = s_texture_cache.Insert(name, std::move(tex));
+  }
+
+  return tex_ptr->get();
+}
+
+bool InvalidateCachedTexture(const std::string& path)
+{
+  return s_texture_cache.Remove(path);
 }
 
 //////////////////////////////////////////////////////////////////////////
@@ -1975,7 +2035,7 @@ void DrawQuickMenu(MainWindowType type)
   if (BeginFullscreenWindow(0.0f, 0.0f, 500.0f, LAYOUT_SCREEN_HEIGHT, "pause_menu", ImVec4(0.0f, 0.0f, 0.0f, 0.0f),
                             0.0f, 10.0f, ImGuiWindowFlags_NoBackground))
   {
-    BeginMenuButtons(11, 1.0f, ImGuiFullscreen::LAYOUT_MENU_BUTTON_X_PADDING,
+    BeginMenuButtons(12, 1.0f, ImGuiFullscreen::LAYOUT_MENU_BUTTON_X_PADDING,
                      ImGuiFullscreen::LAYOUT_MENU_BUTTON_Y_PADDING,
                      ImGuiFullscreen::LAYOUT_MENU_BUTTON_HEIGHT_NO_SUMMARY);
 
@@ -1987,6 +2047,13 @@ void DrawQuickMenu(MainWindowType type)
       s_host_interface->RunLater(
         []() { s_host_interface->SetFastForwardEnabled(!s_host_interface->IsFastForwardEnabled()); });
       CloseQuickMenu();
+    }
+
+    const bool achievements_enabled = Cheevos::IsActive() && (Cheevos::GetAchievementCount() > 0);
+    if (ActiveButton(ICON_FA_TROPHY "  Achievements", false, achievements_enabled))
+    {
+      CloseQuickMenu();
+      s_current_main_window = MainWindowType::Achievements;
     }
 
     if (ActiveButton(ICON_FA_CAMERA "  Save Screenshot", false))
@@ -3463,6 +3530,322 @@ void DrawDebugDebugMenu()
     debug_settings_copy.show_dma_state = debug_settings.show_dma_state;
     s_host_interface->RunLater(SaveAndApplySettings);
   }
+}
+
+void AddNotification(NotificationType type, float duration, std::string title, std::string text, std::string image_path)
+{
+  Notification notif;
+  notif.type = type;
+  notif.duration = duration;
+  notif.title = std::move(title);
+  notif.text = std::move(text);
+  notif.badge_path = std::move(image_path);
+  notif.start_time = Common::Timer::GetValue();
+  s_notifications.push_back(std::move(notif));
+}
+
+void DrawNotifications()
+{
+  if (s_notifications.empty())
+    return;
+
+  const Common::Timer::Value current_time = Common::Timer::GetValue();
+
+  ImVec2 position(0.0f, ImGuiFullscreen::g_layout_padding_top + LayoutScale(LAYOUT_SCREEN_HEIGHT));
+
+  for (u32 index = 0; index < static_cast<u32>(s_notifications.size());)
+  {
+    Notification& notif = s_notifications[index];
+    if (Common::Timer::ConvertValueToSeconds(current_time - notif.start_time) >= notif.duration)
+    {
+      s_notifications.erase(s_notifications.begin() + index);
+      continue;
+    }
+
+    DrawNotification(notif, position);
+    index++;
+  }
+}
+
+void DrawNotification(const Notification& notification, ImVec2& position)
+{
+  const float margin = ImGuiFullscreen::LayoutScale(10.0f);
+  const float horizontal_padding = ImGuiFullscreen::LayoutScale(20.0f);
+  const float vertical_padding = ImGuiFullscreen::LayoutScale(10.0f);
+  const float horizontal_spacing = ImGuiFullscreen::LayoutScale(10.0f);
+  const float vertical_spacing = ImGuiFullscreen::LayoutScale(4.0f);
+  const float badge_size = ImGuiFullscreen::LayoutScale(48.0f);
+  const float min_width = ImGuiFullscreen::LayoutScale(200.0f);
+  const float max_width = ImGuiFullscreen::LayoutScale(500.0f);
+  const float max_text_width = max_width - badge_size - (horizontal_padding * 2.0f) - horizontal_spacing;
+  const float min_height = (vertical_padding * 2.0f) + badge_size;
+  const float shadow_size = ImGuiFullscreen::LayoutScale(4.0f);
+  const float rounding = ImGuiFullscreen::LayoutScale(4.0f);
+
+  ImFont* title_font = ImGuiFullscreen::g_large_font;
+  ImFont* text_font = ImGuiFullscreen::g_medium_font;
+
+  const ImVec2 unlocked_size(text_font->CalcTextSizeA(title_font->FontSize, max_text_width, max_text_width,
+                                                      notification.title.c_str(),
+                                                      notification.title.c_str() + notification.title.size()));
+
+  const ImVec2 text_size(text_font->CalcTextSizeA(text_font->FontSize, max_text_width, max_text_width,
+                                                  notification.text.c_str(),
+                                                  notification.text.c_str() + notification.text.size()));
+
+  const float box_width = std::max(
+    (horizontal_padding * 2.0f) + badge_size + horizontal_spacing + std::max(unlocked_size.x, text_size.x), min_width);
+  const float box_height =
+    std::max((vertical_padding * 2.0f) + unlocked_size.y + vertical_spacing + text_size.y, min_height);
+
+  const ImVec2 box_min(position.x + margin, position.y - (margin + box_height + margin));
+  const ImVec2 box_max(box_min.x + box_width, box_min.y + box_height);
+
+  position.y = box_min.y;
+
+  //////////////////////////////////////////////////////////////////////////
+
+#if 0
+  const u32 toast_background_color = IM_COL32(241, 241, 241, 255);
+  const u32 toast_border_color = IM_COL32(0x88, 0x88, 0x88, 255);
+  const u32 toast_title_color = IM_COL32(1, 1, 1, 255);
+  const u32 toast_text_color = IM_COL32(0, 0, 0, 255);
+#else
+  const u32 toast_background_color = IM_COL32(0x21, 0x21, 0x21, 255);
+  const u32 toast_border_color = IM_COL32(0x48, 0x48, 0x48, 255);
+  const u32 toast_title_color = IM_COL32(0xff, 0xff, 0xff, 255);
+  const u32 toast_text_color = IM_COL32(0xff, 0xff, 0xff, 255);
+#endif
+
+  // ImDrawList* dl = ImGui::GetBackgroundDrawList();
+  ImDrawList* dl = ImGui::GetForegroundDrawList();
+  dl->AddRectFilled(ImVec2(box_min.x + shadow_size, box_min.y + shadow_size),
+                    ImVec2(box_max.x + shadow_size, box_max.y + shadow_size), IM_COL32(20, 20, 20, 180), rounding,
+                    ImDrawCornerFlags_All);
+  dl->AddRectFilled(box_min, box_max, toast_background_color, rounding, ImDrawCornerFlags_All);
+  dl->AddRect(box_min, box_max, toast_border_color, rounding, ImDrawCornerFlags_All,
+              ImGuiFullscreen::LayoutScale(1.0f));
+
+  const ImVec2 badge_min(box_min.x + horizontal_padding, box_min.y + vertical_padding);
+  const ImVec2 badge_max(badge_min.x + badge_size, badge_min.y + badge_size);
+  if (!notification.badge_path.empty())
+  {
+    HostDisplayTexture* tex = GetCachedTexture(notification.badge_path);
+    if (tex)
+      dl->AddImage(tex->GetHandle(), badge_min, badge_max);
+  }
+
+  const ImVec2 unlocked_min(badge_max.x + horizontal_spacing, box_min.y + vertical_padding);
+  const ImVec2 unlocked_max(unlocked_min.x + unlocked_size.x, unlocked_min.y + unlocked_size.y);
+  dl->AddText(title_font, title_font->FontSize, unlocked_min, toast_title_color, notification.title.c_str(),
+              notification.title.c_str() + notification.title.size());
+
+  const ImVec2 title_min(badge_max.x + horizontal_spacing, unlocked_max.y + vertical_spacing);
+  const ImVec2 title_max(title_min.x + text_size.x, title_min.y + text_size.y);
+  dl->AddText(text_font, text_font->FontSize, title_min, toast_text_color, notification.text.c_str(),
+              notification.text.c_str() + notification.text.size(), max_text_width);
+}
+
+void DrawAchievementWindow()
+{
+  static constexpr float alpha = 0.8f;
+  static constexpr float heading_height_unscaled = 110.0f;
+
+  ImGui::SetNextWindowBgAlpha(alpha);
+
+  const ImVec4 background(0.13f, 0.13f, 0.13f, alpha);
+
+  if (BeginFullscreenWindow(
+        0.0f, 0.0f, LAYOUT_SCREEN_WIDTH, heading_height_unscaled, "achievements_heading", background, 0.0f, 0.0f,
+        ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoScrollWithMouse))
+  {
+    ImRect bb;
+    bool visible, hovered;
+    bool pressed = MenuButtonFrame("achievements_heading", false, heading_height_unscaled, &visible, &hovered, &bb.Min,
+                                   &bb.Max, 0, alpha);
+    if (visible)
+    {
+      const float padding = LayoutScale(10.0f);
+      const float spacing = LayoutScale(10.0f);
+      const float image_height = LayoutScale(85.0f);
+
+      const ImVec2 icon_min(bb.Min + ImVec2(padding, padding));
+      const ImVec2 icon_max(icon_min + ImVec2(image_height, image_height));
+
+      const std::string& icon_path = Cheevos::GetGameIcon();
+      if (!icon_path.empty())
+      {
+        HostDisplayTexture* badge = GetCachedTexture(icon_path);
+        if (badge)
+        {
+          ImGui::GetWindowDrawList()->AddImage(badge->GetHandle(), icon_min, icon_max, ImVec2(0.0f, 0.0f),
+                                               ImVec2(1.0f, 1.0f), IM_COL32(255, 255, 255, 255));
+        }
+      }
+
+      float left = bb.Min.x + padding + image_height + spacing;
+      float right = bb.Max.x - padding;
+      float top = bb.Min.y + padding;
+      ImDrawList* dl = ImGui::GetWindowDrawList();
+      SmallString text;
+      ImVec2 text_size;
+
+      const u32 unlocked_count = Cheevos::GetUnlockedAchiementCount();
+      const u32 achievement_count = Cheevos::GetAchievementCount();
+      const u32 current_points = Cheevos::GetCurrentPointsForGame();
+      const u32 total_points = Cheevos::GetMaximumPointsForGame();
+
+      text.Format(ICON_FA_TIMES);
+      text_size = g_large_font->CalcTextSizeA(g_large_font->FontSize, right, -1.0f, text.GetCharArray(),
+                                              text.GetCharArray() + text.GetLength());
+      const ImRect close_button_bb(ImVec2(right - padding - text_size.x, top), ImVec2(right, top + text_size.y));
+
+      bool close_held, close_hovered;
+      bool close_clicked = ImGui::ButtonBehavior(close_button_bb, ImGui::GetCurrentWindow()->GetID("close_button"),
+                                                 &close_hovered, &close_held);
+      if (close_clicked)
+      {
+        ReturnToMainWindow();
+      }
+      else if (close_hovered || close_held)
+      {
+        const ImU32 col = ImGui::GetColorU32(close_held ? ImGuiCol_ButtonActive : ImGuiCol_ButtonHovered, alpha);
+        ImGui::RenderFrame(close_button_bb.Min, close_button_bb.Max, col, true, 0.0f);
+      }
+
+      ImGui::PushFont(g_large_font);
+      ImGui::RenderTextClipped(close_button_bb.Min, close_button_bb.Max, text.GetCharArray(),
+                               text.GetCharArray() + text.GetLength(), nullptr, ImVec2(0.0f, 0.0f), &close_button_bb);
+      ImGui::PopFont();
+
+      const ImRect title_bb(ImVec2(left, top), ImVec2(right, top + g_large_font->FontSize));
+      text.Assign(Cheevos::GetGameTitle());
+
+      const std::string& developer = Cheevos::GetGameDeveloper();
+      if (!developer.empty())
+        text.AppendFormattedString(" (%s)", developer.c_str());
+
+      top += g_large_font->FontSize + spacing;
+
+      ImGui::PushFont(g_large_font);
+      ImGui::RenderTextClipped(title_bb.Min, title_bb.Max, text.GetCharArray(), text.GetCharArray() + text.GetLength(),
+                               nullptr, ImVec2(0.0f, 0.0f), &title_bb);
+      ImGui::PopFont();
+
+      const ImRect summary_bb(ImVec2(left, top), ImVec2(right, top + g_medium_font->FontSize));
+      if (unlocked_count == achievement_count)
+      {
+        text.Format("You have unlocked all achievements and earned %u points!", total_points);
+      }
+      else
+      {
+        text.Format("You have unlocked %u of %u achievements, earning %u of %u possible points.", unlocked_count,
+                    achievement_count, current_points, total_points);
+      }
+
+      top += g_medium_font->FontSize + spacing;
+
+      ImGui::PushFont(g_medium_font);
+      ImGui::RenderTextClipped(summary_bb.Min, summary_bb.Max, text.GetCharArray(),
+                               text.GetCharArray() + text.GetLength(), nullptr, ImVec2(0.0f, 0.0f), &summary_bb);
+      ImGui::PopFont();
+
+      const float progress_height = LayoutScale(20.0f);
+      const ImRect progress_bb(ImVec2(left, top), ImVec2(right, top + progress_height));
+      const float fraction = static_cast<float>(unlocked_count) / static_cast<float>(achievement_count);
+      dl->AddRectFilled(progress_bb.Min, progress_bb.Max, ImGui::GetColorU32(ImGuiFullscreen::UIPrimaryDarkColor()));
+      dl->AddRectFilled(progress_bb.Min,
+                        ImVec2(progress_bb.Min.x + fraction * progress_bb.GetWidth(), progress_bb.Max.y),
+                        ImGui::GetColorU32(ImGuiFullscreen::UISecondaryColor()));
+
+      text.Format("%d%%", static_cast<int>(std::round(fraction * 100.0f)));
+      text_size = ImGui::CalcTextSize(text);
+      const ImVec2 text_pos(progress_bb.Min.x + ((progress_bb.Max.x - progress_bb.Min.x) / 2.0f) - (text_size.x / 2.0f),
+                            progress_bb.Min.y + ((progress_bb.Max.y - progress_bb.Min.y) / 2.0f) -
+                              (text_size.y / 2.0f));
+      dl->AddText(g_medium_font, g_medium_font->FontSize, text_pos,
+                  ImGui::GetColorU32(ImGuiFullscreen::UIPrimaryTextColor()), text.GetCharArray(),
+                  text.GetCharArray() + text.GetLength());
+      top += progress_height + spacing;
+    }
+  }
+  EndFullscreenWindow();
+
+  ImGui::SetNextWindowBgAlpha(alpha);
+
+  if (BeginFullscreenWindow(0.0f, heading_height_unscaled, LAYOUT_SCREEN_WIDTH,
+                            LAYOUT_SCREEN_HEIGHT - heading_height_unscaled, "achievements", background, 0.0f, 0.0f, 0))
+  {
+    const ImVec2 image_size(LayoutScale(LAYOUT_MENU_BUTTON_HEIGHT, LAYOUT_MENU_BUTTON_HEIGHT));
+
+    BeginMenuButtons();
+
+    Cheevos::EnumerateAchievements([&image_size](const Cheevos::Achievement& cheevo) -> bool {
+      TinyString id_str;
+      id_str.Format("%u", cheevo.id);
+
+      ImRect bb;
+      bool visible, hovered;
+      bool pressed =
+        MenuButtonFrame(id_str, true, LAYOUT_MENU_BUTTON_HEIGHT, &visible, &hovered, &bb.Min, &bb.Max, 0, alpha);
+      if (!visible)
+        return true;
+
+      const std::string& badge_path = cheevo.locked ? cheevo.locked_badge_path : cheevo.unlocked_badge_path;
+      if (!badge_path.empty())
+      {
+        HostDisplayTexture* badge = GetCachedTexture(badge_path);
+        if (badge)
+        {
+          ImGui::GetWindowDrawList()->AddImage(badge->GetHandle(), bb.Min, bb.Min + image_size, ImVec2(0.0f, 0.0f),
+                                               ImVec2(1.0f, 1.0f), IM_COL32(255, 255, 255, 255));
+        }
+      }
+
+      const float midpoint = bb.Min.y + g_large_font->FontSize + LayoutScale(4.0f);
+      const float text_start_x = bb.Min.x + image_size.x + LayoutScale(15.0f);
+      const ImRect title_bb(ImVec2(text_start_x, bb.Min.y), ImVec2(bb.Max.x, midpoint));
+      const ImRect summary_bb(ImVec2(text_start_x, midpoint), bb.Max);
+      SmallString text;
+
+      ImGui::PushFont(g_large_font);
+      ImGui::RenderTextClipped(title_bb.Min, title_bb.Max, cheevo.title.c_str(),
+                               cheevo.title.c_str() + cheevo.title.size(), nullptr, ImVec2(0.0f, 0.0f), &title_bb);
+      ImGui::PopFont();
+
+      if (!cheevo.description.empty())
+      {
+        ImGui::PushFont(g_medium_font);
+        ImGui::RenderTextClipped(summary_bb.Min, summary_bb.Max, cheevo.description.c_str(),
+                                 cheevo.description.c_str() + cheevo.description.size(), nullptr, ImVec2(0.0f, 0.0f),
+                                 &summary_bb);
+        ImGui::PopFont();
+      }
+
+      if (!cheevo.locked)
+      {
+        ImGui::PushFont(g_medium_font);
+
+        const ImRect time_bb(ImVec2(text_start_x, bb.Min.y),
+                             ImVec2(bb.Max.x, bb.Min.y + g_medium_font->FontSize + LayoutScale(4.0f)));
+        text.Format("Unlocked 21 Feb, 2019 @ 3:14am");
+        ImGui::RenderTextClipped(time_bb.Min, time_bb.Max, text.GetCharArray(), text.GetCharArray() + text.GetLength(),
+                                 nullptr, ImVec2(1.0f, 0.0f), &time_bb);
+        ImGui::PopFont();
+      }
+
+      if (pressed)
+      {
+        // TODO: What should we do here?
+        // Display information or something..
+      }
+
+      return true;
+    });
+
+    EndMenuButtons();
+  }
+  EndFullscreenWindow();
 }
 
 bool SetControllerNavInput(FrontendCommon::ControllerNavigationButton button, bool value)

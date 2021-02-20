@@ -20,6 +20,8 @@ public:
   bool IsFullscreen() const override;
   bool SetFullscreen(bool enabled) override;
 
+  void OnRunningGameChanged();
+
 protected:
   void PollAndUpdate() override;
 

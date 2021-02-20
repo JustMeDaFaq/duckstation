@@ -27,6 +27,7 @@
     <ClCompile Include="imgui_fullscreen.cpp" />
     <ClCompile Include="fullscreen_ui.cpp" />
     <ClCompile Include="fullscreen_ui_progress_callback.cpp" />
+    <ClCompile Include="cheevos.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="icon.h" />
@@ -55,6 +56,7 @@
     <ClInclude Include="imgui_fullscreen.h" />
     <ClInclude Include="fullscreen_ui.h" />
     <ClInclude Include="fullscreen_ui_progress_callback.h" />
+    <ClInclude Include="cheevos.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="font_roboto_regular.inl" />

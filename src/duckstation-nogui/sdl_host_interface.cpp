@@ -9,6 +9,7 @@
 #include "scmversion/scmversion.h"
 #include "sdl_key_names.h"
 #include <SDL_syswm.h>
+#include "frontend-common/cheevos.h"
 #include <cinttypes>
 #include <cmath>
 Log_SetChannel(SDLHostInterface);
@@ -75,6 +76,9 @@ bool SDLHostInterface::Initialize()
   if (!NoGUIHostInterface::Initialize())
     return false;
 
+  Cheevos::Initialize(this);
+  Cheevos::LoginAsync("ZZZ", "ZZZ");
+
   return true;
 }
 
@@ -102,6 +106,13 @@ bool SDLHostInterface::SetFullscreen(bool enabled)
 
   m_fullscreen = enabled;
   return true;
+}
+
+void SDLHostInterface::OnRunningGameChanged()
+{
+  CommonHostInterface::OnRunningGameChanged();
+
+  Cheevos::GameChanged();
 }
 
 bool SDLHostInterface::RequestRenderWindowSize(s32 new_window_width, s32 new_window_height)
@@ -276,6 +287,7 @@ void SDLHostInterface::PollAndUpdate()
 
   ImGui_ImplSDL2_NewFrame();
   CommonHostInterface::PollAndUpdate();
+  Cheevos::Update();
 }
 
 void SDLHostInterface::HandleSDLEvent(const SDL_Event* event)

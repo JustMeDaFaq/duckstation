@@ -321,7 +321,7 @@ static void GetMenuButtonFrameBounds(float height, ImVec2* pos, ImVec2* size)
 }
 
 static bool MenuButtonFrame(const char* str_id, bool enabled, float height, bool* visible, bool* hovered, ImRect* bb,
-                            ImGuiButtonFlags flags = 0)
+                            ImGuiButtonFlags flags = 0, float hover_alpha = 1.0f)
 {
   ImGuiWindow* window = ImGui::GetCurrentWindow();
   if (window->SkipItems)
@@ -365,7 +365,7 @@ static bool MenuButtonFrame(const char* str_id, bool enabled, float height, bool
     pressed = ImGui::ButtonBehavior(*bb, id, hovered, &held, flags);
     if (*hovered)
     {
-      const ImU32 col = ImGui::GetColorU32(held ? ImGuiCol_ButtonActive : ImGuiCol_ButtonHovered);
+      const ImU32 col = ImGui::GetColorU32(held ? ImGuiCol_ButtonActive : ImGuiCol_ButtonHovered, hover_alpha);
       ImGui::RenderFrame(bb->Min, bb->Max, col, true, 0.0f);
     }
   }
@@ -383,10 +383,10 @@ static bool MenuButtonFrame(const char* str_id, bool enabled, float height, bool
 }
 
 bool MenuButtonFrame(const char* str_id, bool enabled, float height, bool* visible, bool* hovered, ImVec2* min,
-                     ImVec2* max, ImGuiButtonFlags flags /*= 0*/)
+                     ImVec2* max, ImGuiButtonFlags flags /*= 0*/, float hover_alpha /*= 0*/)
 {
   ImRect bb;
-  const bool result = MenuButtonFrame(str_id, enabled, height, visible, hovered, &bb, flags);
+  const bool result = MenuButtonFrame(str_id, enabled, height, visible, hovered, &bb, flags, hover_alpha);
   *min = bb.Min;
   *max = bb.Max;
   return result;

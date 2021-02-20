@@ -1,5 +1,6 @@
 #pragma once
 #include "common/types.h"
+#include <string>
 
 class CommonHostInterface;
 class SettingsInterface;
@@ -17,7 +18,7 @@ enum class MainWindowType
   GameList,
   Settings,
   QuickMenu,
-  MoreQuickMenu
+  Achievements,
 };
 
 enum class SettingsPage
@@ -37,6 +38,13 @@ enum class SettingsPage
   Count
 };
 
+enum class NotificationType
+{
+  GameChanged,
+  AchievementProgress,
+  AchievementUnlocked,
+};
+
 bool Initialize(CommonHostInterface* host_interface, SettingsInterface* settings_interface);
 bool HasActiveWindow();
 void SystemCreated();
@@ -47,6 +55,8 @@ void CloseQuickMenu();
 void Shutdown();
 void Render();
 
+bool InvalidateCachedTexture(const std::string& path);
+
 // Returns true if the message has been dismissed.
 bool DrawErrorWindow(const char* message);
 bool DrawConfirmWindow(const char* message, bool* result);
@@ -56,6 +66,9 @@ void EnsureGameListLoaded();
 Settings& GetSettingsCopy();
 void SaveAndApplySettings();
 void SetDebugMenuEnabled(bool enabled, bool save_to_ini = false);
+
+void AddNotification(NotificationType type, float duration, std::string title, std::string text,
+                     std::string image_path);
 
 /// Only ImGuiNavInput_Activate, ImGuiNavInput_Cancel, and DPad should be forwarded.
 /// Returns true if the UI consumed the event, and it should not execute the normal handler.
